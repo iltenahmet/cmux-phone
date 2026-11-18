@@ -1,6 +1,6 @@
 {
-  "name": "tmux",
-  "short_name": "tmux",
+  "name": "cmux",
+  "short_name": "cmux",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Feeds screens captured from Codex and Cursor (tests/screens) to server.py's status and last-line parser.
 
-Each file is `<agent>_<state>.txt`, captured with `tmux capture-pane -p` from a real run.
+Each file is `<agent>_<state>.txt`, captured from a real run.
 
 Usage: python3 tests/agent_screens_test.py
 """

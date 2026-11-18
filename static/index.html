@@ -5,13 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, interactive-widget=resizes-content, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="tmux">
+<meta name="apple-mobile-web-app-title" content="cmux">
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="theme-color" content="#000000">
 <meta name="version" content="{{VERSION}}">
 <link rel="manifest" href="/manifest.json">
 <link rel="apple-touch-icon" href="/icon-180.png">
-<title>tmux</title>
+<title>cmux</title>
 <link rel="stylesheet" href="/vendor/xterm.css">
 <style>
   :root {
@@ -41,7 +41,7 @@
     display: flex; flex-direction: column; }
   /* The strip names the open pane's window (or the list's session) in its top part, over the home indicator's zone;
      nothing in it is tappable.
-     A dim line splits it from the key bar or the list. The phone's tmux session has its status line turned off. */
+     A dim line splits it from the key bar or the list. */
   #statusline { position: absolute; left: 0; right: 0; bottom: 0; height: var(--strip); display: flex; align-items: flex-start;
     justify-content: center; padding-top: 2px; border-top: 1px solid var(--line); background: var(--bg); color: var(--fg);
     font-size: 12px; line-height: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -151,7 +151,7 @@
 
 <section id="list" class="view">
   <header>
-    <h1>tmux</h1>
+    <h1>cmux</h1>
     <button id="theme-open">theme</button>
     <button id="edit">edit</button>
   </header>
@@ -230,7 +230,7 @@ let panes = [], sessions = [], editMode = false, renaming = false;  // the list 
 
 // iOS keeps the layout height when the keyboard opens, and scrolls the page to show the focused input.
 // Undo the scroll and pin the page to what is actually visible above the keyboard and its accessory bar.
-// The terminal refits when its box changes size, so tmux gets the smaller screen.
+// The terminal refits when its box changes size, so the pane gets the smaller screen.
 function fitViewport() {
   window.scrollTo(0, 0);
   const vv = window.visualViewport || { height: window.innerHeight, offsetTop: 0 };
@@ -283,8 +283,6 @@ async function loadPanes(poll = false) {
   panes = fresh.panes;
   sessions = fresh.sessions;
   if (fresh.version !== VERSION) reloadWhenSafe();
-  const open = panes.find((p) => p.id === current);
-  if (open) hideBorderRow(open.border);
   for (const p of panes) lastTitle[p.id] = p.title || p.command;
   renderStrip();
   if (!renaming && !(poll && editMode)) renderPanes();
@@ -308,7 +306,7 @@ function renderPanes() {
   const addWindow = editMode ? `<button class="br primary add-window" data-act="new-window">+ window</button>` : "";
   const top = renderSessions(b);
   if (!panes.length) {
-    $("list-body").innerHTML = `${top}<div class="window-name">No tmux panes. Tap [edit], then [+ window].</div>${addWindow}`;
+    $("list-body").innerHTML = `${top}<div class="window-name">No cmux panes. Tap [edit], then [+ window].</div>${addWindow}`;
     return;
   }
   const chip = (p) => p.status ? `<span class="status ${p.status}">${STATUS_LABEL[p.status]}</span>` : "";
@@ -326,22 +324,20 @@ function renderPanes() {
       </${tag}>`).join("")}`).join("") + addWindow;
 }
 
-// The session row: tap a session to show its windows on the phone. Hidden with one session, outside edit mode.
-// In edit mode each session gets its own row with [rename] [x], the phone's session in reverse video.
+// The session row: a session is a cmux window, numbered as cmux lists them. Tap one to show its workspaces on the
+// phone. Hidden with one session, outside edit mode. In edit mode each gets its own row with [x].
 function renderSessions(b) {
   if (editMode) return `<div id="sessions" class="editing">${sessions.map((s) => `
     <div class="session-row"><span class="name${s.current ? " current" : ""}">${esc(s.name)}</span><span class="gap"></span><span class="acts">${
-      b("rename-session", s.id, "rename")}${b("close-session", s.id, "x", "danger")}</span></div>`).join("")}
+      b("close-session", s.id, "x", "danger")}</span></div>`).join("")}
     <button class="br primary add-session" data-act="new-session">+ session</button></div>`;
   if (sessions.length < 2) return "";
   return `<div id="sessions"><span class="label">session:</span>${sessions.map((s) =>
     `<button class="br${s.current ? " current" : ""}" data-session="${s.id}">${esc(s.name)}</button>`).join("")}</div>`;
 }
 
-// A session change remakes the phone's tmux session, which ends the terminal's attach; connect again to the new one.
 async function sessionAct(path, body) {
-  const r = await act(path, body);
-  if (r && socket) connect();
+  await act(path, body);
   loadPanes();
 }
 
@@ -387,9 +383,7 @@ $("list-body").addEventListener("click", async (e) => {
 });
 
 async function runAction(action, id, name) {
-  if (action === "rename-session") {
-    rename(name, sessions.find((s) => s.id === id).name, `/api/sessions/${id}/rename`);
-  } else if (action === "rename-window") {
+  if (action === "rename-window") {
     rename(name, panes.find((p) => p.window_id === id).window_name, `/api/windows/${id}/rename`);
   } else if (action === "rename-pane") {
     rename(name, panes.find((p) => p.id === id).title, `/api/panes/${id}/rename`);
@@ -418,7 +412,7 @@ $("edit").addEventListener("click", () => {
 // A new version on the Mac reloads the page, as the Home Screen app has no reload button.
 // Never in the middle of something: a recording, a send, a name being typed.
 // Until then each list poll tries again. The open pane is opened again after the reload.
-const VERSION = document.querySelector('meta[name="version"]').content, PANE_KEY = "tmux-phone.pane", FILES_KEY = "tmux-phone.files";
+const VERSION = document.querySelector('meta[name="version"]').content, PANE_KEY = "cmux-phone.pane", FILES_KEY = "cmux-phone.files";
 function reloadWhenSafe() {
   if (recorder || unsent || $("mic").disabled || $("attach").disabled || $("paste").disabled || renaming) return;
   if (file && file.changed) return;
@@ -430,16 +424,19 @@ function reloadWhenSafe() {
 }
 
 async function openPane(id) {
-  const r = await act(`/api/panes/${id}/open`);
-  if (!r) return;
-  current = id;
-  atBottom();
+  // The terminal is laid out first, so the pane is opened at the size the phone shows.
   $("pane-title").textContent = lastTitle[id] || "";
   $("list").classList.add("hidden");
   $("pane").classList.remove("hidden");
-  // One terminal connection for the whole visit; tmux switches what it shows.
-  if (!socket) startTerminal();
-  hideBorderRow(r.border);
+  if (!started) startTerminal(); else fit.fit();
+  const r = await act(`/api/panes/${id}/open`, { cols: term.cols, rows: term.rows });
+  if (!r) {
+    if (!current) { $("pane").classList.add("hidden"); $("list").classList.remove("hidden"); }
+    return;
+  }
+  current = id;
+  atBottom();
+  connect();
   loadPanes();
 }
 
@@ -448,6 +445,7 @@ async function showList() {
   disarm();
   unsent = null;
   setMic(MIC_ICON);
+  disconnect();
   if (current) await act(`/api/panes/${current}/back`);
   current = null;
   $("pane").classList.add("hidden");
@@ -475,7 +473,7 @@ document.addEventListener("touchstart", () => {}, { passive: true });
 // iOS moves focus on the mousedown it fires after the touch. Blocking pointerdown instead would also block the click.
 $("keys").addEventListener("mousedown", (e) => e.preventDefault());
 
-// Ctrl and Alt stay on until the next key typed into the terminal, so Ctrl then b is the tmux prefix.
+// Ctrl and Alt stay on until the next key typed into the terminal, so Ctrl then c is Ctrl-C.
 const mods = { ctrl: false, alt: false };
 
 function setMod(name, on) {
@@ -631,10 +629,10 @@ $("mic").addEventListener("click", async () => {
   timer = setInterval(tick, 1000);
 });
 
-// Our own client for ttyd's websocket (ttyd 1.7.7). The page sends its size as JSON first, then
-// "0" + typed bytes and "1" + new size. ttyd sends "0" + output, "1" + title, "2" + its settings.
+// The terminal is xterm.js, fed by the server: the open pane's screen arrives as server-sent events, each a frame
+// of escape sequences that redraws it. What is typed goes back as POSTs, one at a time so it stays in order.
 // Pinch on the terminal sets its font size; it is kept in this browser for next time.
-const MIN_FONT = 8, MAX_FONT = 20, FONT_KEY = "tmux-phone.fontSize";
+const MIN_FONT = 8, MAX_FONT = 20, FONT_KEY = "cmux-phone.fontSize";
 function savedFontSize() {
   try {
     const n = Number(localStorage.getItem(FONT_KEY));
@@ -644,20 +642,33 @@ function savedFontSize() {
 const term = new Terminal({ fontSize: savedFontSize(), fontFamily: "Menlo, monospace" });
 const fit = new FitAddon.FitAddon();
 term.loadAddon(fit);
-const encoder = new TextEncoder();
-let socket = null, retryMs = 1000, retryTimer = null;
+let started = false, stream = null, typed = "", sending = false;
+
+// Typed bytes wait here while a POST is on its way, then go together in the next one.
+async function sendInput(data) {
+  typed += data;
+  if (sending) return;
+  sending = true;
+  while (typed && current) {
+    const data = typed;
+    typed = "";
+    await act(`/api/panes/${current}/input`, { data });
+  }
+  typed = "";
+  sending = false;
+}
 
 function startTerminal() {
+  started = true;
   term.open($("term"));
   fit.fit();
   term.onData((data) => {
-    if (socket.readyState !== WebSocket.OPEN) return;
+    if (!current) return;
     atBottom();
-    socket.send(encoder.encode("0" + withMods(data)));
+    sendInput(withMods(data));
   });
-  term.onResize(({ cols, rows }) => {
-    if (socket.readyState === WebSocket.OPEN) socket.send(encoder.encode("1" + JSON.stringify({ columns: cols, rows })));
-  });
+  // The pane on the Mac takes the phone's size while it is open here.
+  term.onResize(({ cols, rows }) => { if (current) act(`/api/panes/${current}/fit`, { cols, rows }); });
   // Fit to the box whenever it changes size, e.g. when the keyboard opens. Skipped while hidden, which reads as 0 wide.
   // Waits 50 ms for the size to settle, as the keyboard slides in over several steps.
   let fitTimer = null;
@@ -665,37 +676,32 @@ function startTerminal() {
     clearTimeout(fitTimer);
     fitTimer = setTimeout(() => { if ($("term-wrap").clientWidth) fit.fit(); }, 50);
   }).observe($("term-wrap"));
-  connect();
 }
 
-// Any close reconnects by itself, waiting 1 s, then 2 s, up to 5 s; nothing needs a key press.
+// The browser reconnects a dropped stream by itself. A pane that is gone ends it and goes back to the list.
 function connect() {
-  clearTimeout(retryTimer);
-  if (socket) { socket.onclose = socket.onmessage = null; socket.close(); }
-  const ws = socket = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/term/ws`, ["tty"]);
-  ws.binaryType = "arraybuffer";
-  ws.onopen = () => {
-    retryMs = 1000;
-    term.reset();  // tmux redraws the whole screen on attach
-    ws.send(encoder.encode(JSON.stringify({ AuthToken: "", columns: term.cols, rows: term.rows })));
-  };
-  ws.onmessage = (e) => {
-    const data = new Uint8Array(e.data);
-    if (data[0] === 48) term.write(data.subarray(1));  // "0" is output; title and settings are not used
-  };
-  ws.onclose = () => {
-    retryTimer = setTimeout(connect, retryMs);
-    retryMs = Math.min(retryMs * 2, 5000);
-  };
+  disconnect();
+  term.reset();
+  const pane = current, es = stream = new EventSource(`/api/panes/${pane}/stream`);
+  es.onmessage = (e) => { if (stream === es) term.write(JSON.parse(e.data).frame); };
+  es.addEventListener("gone", () => {
+    if (stream !== es) return;
+    disconnect();
+    current = null;
+    showList();
+  });
 }
 
-// tmux draws on the terminal's alternate screen, so the browser terminal has nothing of its own to scroll.
-// A vertical swipe sends mouse wheel input to tmux instead, as the Mac's wheel does: tmux hands it to the app
-// if the app reads the mouse (Claude Code scrolls its own chat), and scrolls the pane's history if not.
-// This needs `mouse on` in tmux, which also makes tmux ask for SGR mouse codes. A tap opens the keyboard.
-// The text follows the finger: one wheel event per (row height x lines one event scrolls) of finger movement.
-// tmux's copy mode scrolls 5 lines per event (its WheelUpPane binding); Claude Code scrolls 1 (measured).
-const APP_LINES = 1, COPY_LINES = 5, MAX_WHEEL = 10;
+function disconnect() {
+  if (stream) stream.close();
+  stream = null;
+}
+
+// The pane's screen has nothing of its own to scroll in the browser. A vertical swipe sends mouse wheel input to
+// the Mac instead: an app that reads the mouse gets it (Claude Code scrolls its own chat), and otherwise the
+// server scrolls back through the pane's history. A tap opens the keyboard.
+// The text follows the finger: one wheel event, one line, per row height of finger movement.
+const MAX_WHEEL = 10;
 let scrollY = null, scrollPx = 0, swiped = false;
 let wheelUps = 0;  // net wheel-up events since the pane was last at the bottom; [↓ bottom] shows while above 0
 let pinch = null;  // finger distance and font size when a two-finger pinch began
@@ -707,24 +713,8 @@ function setFontSize(size) {
   term.options.fontSize = size;
   document.body.style.setProperty("--font-size", `${size}px`);  // the file screen's size
   if (file && file.view) file.view.requestMeasure();
-  fit.fit();  // the new columns and rows go to ttyd through onResize, and tmux re-fits the window
-  hideBorderRow(hiddenRow);  // one row is now a different height
+  fit.fit();  // the new columns and rows go to the Mac through onResize, and the pane re-fits
   try { localStorage.setItem(FONT_KEY, String(size)); } catch {}
-}
-
-// tmux's pane title row (pane-border-status) is one row above or below the pane. The phone shows one pane, so it
-// hides that row: the terminal gets one more row than fits, and that row sits outside #term-wrap, which clips it.
-// tmux gets the full row count, so its layout stays right. Wheel rows come from the screen's real box, hidden row included.
-let hiddenRow = null;  // "top", "bottom" or null, as the server reports it for the open pane
-function hideBorderRow(border) {
-  hiddenRow = border || null;
-  if (!term.element || !$("term-wrap").clientHeight) return;
-  const rowPx = term.element.querySelector(".xterm-screen").getBoundingClientRect().height / term.rows;
-  if (!rowPx) return;
-  const height = hiddenRow ? `calc(100% + ${rowPx}px)` : "", top = hiddenRow === "top" ? `-${rowPx}px` : "";
-  if ($("term").style.height === height && $("term").style.marginTop === top) return;
-  Object.assign($("term").style, { height, marginTop: top });
-  fit.fit();
 }
 
 function atBottom() {
@@ -733,19 +723,17 @@ function atBottom() {
 }
 
 function wheelPx() {
-  const rowPx = term.element.querySelector(".xterm-screen").getBoundingClientRect().height / term.rows;
-  const p = panes.find((p) => p.id === current);
-  return rowPx * (p && p.reads_mouse ? APP_LINES : COPY_LINES);
+  return term.element.querySelector(".xterm-screen").getBoundingClientRect().height / term.rows;
 }
 
 function sendWheel(up, count, x, y) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  if (!current) return;
   wheelUps = Math.max(0, wheelUps + (up ? count : -count));
   $("to-bottom").classList.toggle("hidden", !wheelUps);
   const box = term.element.querySelector(".xterm-screen").getBoundingClientRect();
   const col = Math.min(term.cols, Math.max(1, Math.floor((x - box.left) / (box.width / term.cols)) + 1));
   const row = Math.min(term.rows, Math.max(1, Math.floor((y - box.top) / (box.height / term.rows)) + 1));
-  socket.send(encoder.encode("0" + `\x1b[<${up ? 64 : 65};${col};${row}M`.repeat(count)));
+  act(`/api/panes/${current}/scroll`, { up, count, col, row });
 }
 
 $("term-wrap").addEventListener("touchstart", (e) => {
@@ -788,7 +776,7 @@ $("term-wrap").addEventListener("touchend", (e) => {
 }, { passive: true, capture: true });
 
 // [↓ bottom] sends wheel-down in chunks of 10, 20 more than were sent up, in case the count is off.
-// In copy mode tmux leaves it at the bottom; Claude Code ignores the extra.
+// The pane's history stops at the bottom; Claude Code ignores the extra.
 $("to-bottom").addEventListener("click", async () => {
   const box = term.element.querySelector(".xterm-screen").getBoundingClientRect();
   let left = wheelUps + 20;
@@ -944,7 +932,7 @@ $("files-back").addEventListener("click", () => {
   if (!file) {
     $("files").classList.add("hidden");
     $("pane").classList.remove("hidden");
-    hideBorderRow(hiddenRow);  // the font size may have changed on the file screen
+    fit.fit();  // the font size may have changed on the file screen
     return;
   }
   if (file.changed && !confirm(`Leave ${file.path.split("/").pop()} without saving? Your changes are lost.`)) return;
@@ -982,7 +970,7 @@ const THEMES = {
   "solarized-dark": "#002b36 #839496 #073642 #073642 #dc322f #859900 #b58900 #268bd2 #d33682 #2aa198 #eee8d5 #335e69 #cb4b16 #586e75 #657b83 #839496 #6c71c4 #93a1a1 #fdf6e3",
   "xterm": "#000000 #d0d0d0 #303030 #000000 #cd3131 #0dbc79 #e5e510 #2472c8 #bc3fbc #11a8cd #e5e5e5 #666666 #f14c4c #23d18b #f5f543 #3b8eea #d670d6 #29b8db #e5e5e5",
 };
-const THEME_KEY = "tmux-phone.theme", ANSI = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+const THEME_KEY = "cmux-phone.theme", ANSI = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
 let theme = "monokai";
 try { if (THEMES[localStorage.getItem(THEME_KEY)]) theme = localStorage.getItem(THEME_KEY); } catch {}
 
@@ -1028,7 +1016,7 @@ setTheme(theme);
 
 // iOS drops the connection while the app is in the background; reconnect at once on return.
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && socket && socket.readyState !== WebSocket.OPEN) connect();
+  if (!document.hidden && current && started) connect();
 });
 
 // The poll also runs in the pane view, to see a new version.

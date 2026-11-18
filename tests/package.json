@@ -1,5 +1,5 @@
 {
-  "name": "tmux-phone-tests",
+  "name": "cmux-phone-tests",
   "private": true,
   "type": "module",
   "scripts": {

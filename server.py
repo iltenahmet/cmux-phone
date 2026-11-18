@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Phone UI for the tmux session on this Mac, served on the tailnet via `tailscale serve`."""
+"""Phone UI for the cmux panes on this Mac, served on the tailnet via `tailscale serve`."""
 import base64
-import fcntl
 import glob
 import hashlib
 import json
@@ -15,18 +14,22 @@ import time
 import traceback
 import unicodedata
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http.client import HTTPConnection
-from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-HOST, PORT = "127.0.0.1", int(os.environ.get("TMUX_PHONE_PORT", "8766"))
+HOST, PORT = "127.0.0.1", int(os.environ.get("CMUX_PHONE_PORT", "8768"))
 # Set by install.sh in the launchd job: this Mac's tailnet URL, and the one Tailscale login allowed in.
-PUBLIC_ORIGIN = os.environ.get("TMUX_PHONE_ORIGIN", "")
-ALLOWED_LOGIN = os.environ.get("TMUX_PHONE_LOGIN", "")
-STATE = Path.home() / ".local/state/tmux-phone"
-TTYD_SOCKET = STATE / "ttyd.sock"
+PUBLIC_ORIGIN = os.environ.get("CMUX_PHONE_ORIGIN", "")
+ALLOWED_LOGIN = os.environ.get("CMUX_PHONE_LOGIN", "")
+DEV = "--dev" in sys.argv  # no Tailscale login check and no dictation; for testing on localhost only
+CMUX_SOCKET = os.environ.get("CMUX_SOCKET_PATH") or str(Path.home() / ".local/state/cmux/cmux.sock")
+CMUX_CLI = "/Applications/cmux.app/Contents/Resources/bin/cmux"
+STATE = Path(os.environ.get("CMUX_PHONE_STATE") or Path.home() / ".local/state/cmux-phone")  # the browser test sets its own
+TARGET_FILE = STATE / "target"  # id of the cmux window the list shows
+FITTED_FILE = STATE / "fitted.json"  # panes sized to the phone, and the size policy each had before
 STATIC = Path(__file__).resolve().parent / "static"
 INDEX = STATIC / "index.html"
 SERVER_SOURCE = Path(__file__).read_bytes()  # a change to this file needs a restart, so reading it once is enough
@@ -42,23 +45,28 @@ UPLOADS = STATE / "uploads"
 UPLOAD_DAYS = 7
 IMAGE_TYPES = {b"\x89PNG\r\n\x1a\n": "png", b"\xff\xd8\xff": "jpg", b"GIF87a": "gif", b"GIF89a": "gif"}
 WHISPER_MODEL = STATE / "models/ggml-large-v3-turbo-q5_0.bin"
-WHISPER_HOST, WHISPER_PORT = "127.0.0.1", int(os.environ.get("TMUX_PHONE_WHISPER_PORT", "8767"))
+WHISPER_HOST, WHISPER_PORT = "127.0.0.1", int(os.environ.get("CMUX_PHONE_WHISPER_PORT", "8769"))
 
-PANE_ROUTE = re.compile(r"^/api/panes/(\d+)/(open|back|paste|key|close|rename)$")
-WINDOW_ROUTE = re.compile(r"^/api/windows/(\d+)/(rename|panes|close)$")  # by window id: 3 is tmux's @3
-SESSION_ROUTE = re.compile(r"^/api/sessions/(\d+)/(switch|rename|close)$")  # by session id: 3 is tmux's $3
+# Ids are cmux's own: a pane is a terminal surface, a window is a workspace, a session is a cmux window.
+ID = r"([0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12})"
+PANE_ROUTE = re.compile(rf"^/api/panes/{ID}/(open|back|fit|input|scroll|paste|key|close|rename)$")
+STREAM_ROUTE = re.compile(rf"^/api/panes/{ID}/stream$")
+WINDOW_ROUTE = re.compile(rf"^/api/windows/{ID}/(rename|panes|close)$")
+SESSION_ROUTE = re.compile(rf"^/api/sessions/{ID}/(switch|close)$")
 MAX_NAME = 100
-# Phone button name -> tmux send-keys name. Digits answer Claude's numbered menus.
-KEYS = {"enter": "Enter", "escape": "Escape", "up": "Up", "down": "Down", "left": "Left", "right": "Right",
-        "tab": "Tab", "shift+tab": "BTab", "ctrl+c": "C-c", "alt+p": "M-p", "0": "0", "1": "1", "2": "2", "3": "3"}
-PANE_FIELDS = ["pane_id", "window_id", "window_index", "window_name", "pane_index", "pane_title", "pane_tty", "pane_active",
-               "window_active", "window_zoomed_flag", "window_panes", "pane_current_command", "mouse_any_flag",
-               "pane_top", "pane_height", "window_height", "pane-border-status"]
+# Phone button name -> cmux send_key name. Digits answer Claude's numbered menus; cmux has no digit keys, so they are typed.
+KEYS = {"enter": "enter", "escape": "escape", "up": "up", "down": "down", "left": "left", "right": "right",
+        "tab": "tab", "shift+tab": "shift+tab", "ctrl+c": "ctrl+c", "alt+p": "alt+p", "0": "0", "1": "1", "2": "2", "3": "3"}
+MIN_COLS, MAX_COLS, MIN_ROWS, MAX_ROWS = 20, 300, 5, 200
+FIT_LEASE_SECONDS = 15  # an open terminal stream renews it; a phone that vanishes hands the pane back to the Mac
+STREAM_SECONDS = 0.08  # how often an open pane's screen is read
+MOUSE_MODES = {1000, 1002, 1003}  # the app in the pane asked for mouse events, so it gets the wheel
+
 
 # Claude Code draws its conversation, a rule, the ❯ input line, then a footer.
 RULE = re.compile(r"^\s*─{8,}")
 BULLET = re.compile(r"^[⏺●•] ")
-CLAUDE_NOTICE = re.compile(r"new task\? /clear|Compacted\s+while\s+idle|^[⏺●•] Compacted\b|0: Dismiss\s*$|^\s*1: Learn more\s*$")
+CLAUDE_NOTICE = re.compile(r"new task\? /clear|Compacted\s+while\s+idle|^[⏺●•] Compacted\b|Update installed · /restart|0: Dismiss\s*$|^\s*1: Learn more\s*$")
 # Claude Code's spinner line ("✻ Thinking…"), or Cursor's (" ⠰⠳ Working").
 SPINNER = re.compile(r"^[✻✶✳✢✽·*+] \S.*…|^ [⠀-⣿]+ \S")
 # The coding agents a pane can run, by process name. Cursor's CLI is started as `agent` or `cursor-agent`.
@@ -74,101 +82,341 @@ WORKING = {"claude": SPINNER, "cursor": re.compile(r"ctrl\+c to stop\s*$"), "cod
 CODEX_ASK = re.compile(r"to confirm\b|to submit (answer|all)\b|enter continue")
 
 
-class TmuxError(Exception):
-    pass
+class CmuxError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
 
 
 class WhisperError(Exception):
     pass
 
 
-def tmux(*args, stdin=None):
-    r = subprocess.run(["tmux", *args], input=stdin, capture_output=True, text=True, timeout=10)
+def rpc(method, params=None):
+    """One call on cmux's socket: a JSON line out, a JSON line back."""
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(10)
+            s.connect(CMUX_SOCKET)
+            s.sendall(json.dumps({"id": 1, "method": method, "params": params or {}}).encode() + b"\n")
+            buf = bytearray()
+            while not buf.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+    except OSError as e:
+        raise CmuxError("unavailable", f"cmux is not reachable ({e})") from e
+    try:
+        reply = json.loads(buf)
+    except ValueError as e:
+        raise CmuxError("bad_reply", "cmux sent an unreadable reply") from e
+    if not reply.get("ok"):
+        err = reply.get("error") or {}
+        raise CmuxError(err.get("code", "error"), err.get("message", "cmux refused the request"))
+    return reply.get("result") or {}
+
+
+def cmux_cli(*args):
+    """The cmux CLI, for making workspaces and splits: its flags are documented, the socket's parameters are not."""
+    r = subprocess.run([CMUX_CLI, *args], capture_output=True, text=True, timeout=30,
+                       env={**os.environ, "CMUX_SOCKET_PATH": CMUX_SOCKET, "CMUX_QUIET": "1"})
     if r.returncode:
-        raise TmuxError(r.stderr.strip() or "tmux failed")
+        raise CmuxError("cli", (r.stderr or r.stdout).strip() or "cmux refused the request")
     return r.stdout
 
 
-# The phone's viewer: a hidden tmux session grouped with one real session, the target. It shares the target's
-# windows but has its own current window and no status line, so switching windows on the phone does not move the Mac.
-# It is never listed as a session. The target is the real session in the viewer's group, so tmux itself remembers it.
-VIEWER = "_phone"
-OLD_VIEWER = "phone"  # the viewer's name before _phone
-SESSION_FIELDS = ["session_id", "session_name", "session_grouped", "session_group", "session_windows",
-                  "session_attached", "session_last_attached", "session_activity"]
+def windows():
+    """Every cmux window with its workspaces, panes and surfaces."""
+    return rpc("system.tree", {"all_windows": True}).get("windows", [])
 
 
-def list_sessions():
-    """Every tmux session, the viewer included, most recently used first. No tmux server means no sessions."""
-    r = subprocess.run(["tmux", "list-sessions", "-F", "\x1f".join(f"#{{{f}}}" for f in SESSION_FIELDS)],
-                       capture_output=True, text=True)
-    rows = [dict(zip(SESSION_FIELDS, line.split("\x1f"))) for line in r.stdout.splitlines()] if r.returncode == 0 else []
-    return sorted(rows, key=lambda s: (int(s["session_last_attached"] or 0), int(s["session_activity"] or 0)), reverse=True)
+def surfaces(window):
+    """The terminal surfaces of one cmux window, in workspace order. Browser tabs are not panes."""
+    out = []
+    for ws in window.get("workspaces", []):
+        for pane in ws.get("panes", []):
+            for s in pane.get("surfaces", []):
+                if s.get("type") == "terminal":
+                    out.append({"id": s["id"], "ref": s["ref"], "title": s.get("title") or "", "tty": s.get("tty") or "",
+                                "active": bool(s.get("focused") and ws.get("selected")), "workspace": ws})
+    return out
 
 
-def viewer_target(sessions):
-    """Id of the real session the viewer is grouped with, or None if the viewer or that session is gone."""
-    viewer = next((s for s in sessions if s["session_name"] == VIEWER), None)
-    if not viewer or viewer["session_grouped"] != "1":
-        return None
-    return next((s["session_id"] for s in sessions if s["session_name"] != VIEWER and s["session_grouped"] == "1"
-                 and s["session_group"] == viewer["session_group"]), None)
+def target_window(tree):
+    """The cmux window the list shows: the one picked on the phone while it is open, else the first.
+    None when cmux has no window."""
+    try:
+        saved = TARGET_FILE.read_text().strip()
+    except OSError:
+        saved = ""
+    return next((w for w in tree if w["id"] == saved), tree[0] if tree else None)
 
 
-@contextmanager
-def viewer_lock():
-    """One change to the viewer at a time: ttyd's attach and the web server both remake it."""
-    with open(STATE / "viewer.lock", "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        yield
+def sessions_for_phone(tree, target):
+    """cmux windows have no names, so they are numbered as cmux lists them."""
+    return [{"id": w["id"], "name": str(i + 1), "windows": len(w.get("workspaces", [])), "attached": 1,
+             "current": bool(target) and w["id"] == target["id"]} for i, w in enumerate(tree)]
 
 
-def new_real_session():
-    """An ordinary tmux session with tmux's numbered name, which the Mac sees in `tmux ls`. Returns its id."""
-    return tmux("new-session", "-d", "-c", str(Path.home()), "-P", "-F", "#{session_id}").strip()
+def find_pane(pane):
+    """The surface with this id in any window. Raises the error the page takes as "this pane is gone"."""
+    for w in windows():
+        for s in surfaces(w):
+            if s["id"].lower() == pane.lower():
+                return s
+    raise CmuxError("not_found", f"can't find pane {pane}")
 
 
-def group_viewer(target):
-    """Make the viewer again, grouped with target ($id). tmux can't move a session to another group.
-    Killing the old viewer ends ttyd's attach, and the page reconnects to the new one. Caller holds viewer_lock."""
-    subprocess.run(["tmux", "kill-session", "-t", f"={VIEWER}"], capture_output=True)
-    tmux("new-session", "-d", "-s", VIEWER, "-t", target)
-    tmux("set-option", "-t", f"={VIEWER}:", "status", "off")  # set-option takes a pane target, so the colon
-    tmux("set-option", "-t", f"={VIEWER}:", "detach-on-destroy", "on")  # killed, its client exits, not moves to the Mac's session
+def find_workspace(workspace):
+    for w in windows():
+        for ws in w.get("workspaces", []):
+            if ws["id"].lower() == workspace.lower():
+                return ws
+    raise CmuxError("not_found", f"can't find window {workspace}")
 
 
-def fix_viewer():
-    """Keep the viewer's target while it exists. Else group it with the most recently used real session,
-    or with a new real session if there is none. Returns the target's id. Caller holds viewer_lock."""
-    sessions = list_sessions()
-    target = viewer_target(sessions)
-    if target:
-        return target
-    real = [s["session_id"] for s in sessions if s["session_name"] != VIEWER]
-    target = real[0] if real else new_real_session()
-    group_viewer(target)
-    return target
+def grid(pane):
+    return rpc("terminal.replay", {"terminal_id": pane}).get("render_grid") or {}
 
 
-def ensure_viewer():
-    with viewer_lock():
-        return fix_viewer()
+def rows_of(spans, count):
+    """Spans grouped by row, each row's spans left to right."""
+    rows = [[] for _ in range(count)]
+    for span in spans:
+        if 0 <= span["row"] < count:
+            rows[span["row"]].append(span)
+    for row in rows:
+        row.sort(key=lambda s: s["column"])
+    return rows
 
 
-def kill_old_viewer():
-    """Before _phone, the viewer was named phone. Kill it if it is grouped with a real session: it only showed that
-    session's windows. A phone session standing alone, or grouped only with _phone, holds real work and stays."""
-    sessions = list_sessions()
-    old = next((s for s in sessions if s["session_name"] == OLD_VIEWER and s["session_grouped"] == "1"), None)
-    if old and any(s["session_group"] == old["session_group"] and s["session_name"] not in (OLD_VIEWER, VIEWER)
-                   for s in sessions):
-        tmux("kill-session", "-t", old["session_id"])
+def plain(row):
+    """One row of the screen as text, each span at its column."""
+    out = ""
+    for span in row:
+        out += " " * (span["column"] - len(out)) + span["text"]
+    return out.rstrip()
 
 
-def sessions_for_phone(target):
-    return [{"id": s["session_id"].lstrip("$"), "name": s["session_name"], "windows": int(s["session_windows"]),
-             "attached": int(s["session_attached"]), "current": s["session_id"] == target}
-            for s in list_sessions() if s["session_name"] != VIEWER]
+def screen_lines(g):
+    return [plain(row) for row in rows_of(g.get("row_spans", []), g.get("rows", 0))]
+
+
+def reads_mouse(g):
+    return any(m.get("on") and not m.get("ansi") and m.get("code") in MOUSE_MODES for m in g.get("modes", []))
+
+
+def rgb(color):
+    return f"2;{int(color[1:3], 16)};{int(color[3:5], 16)};{int(color[5:7], 16)}"
+
+
+def sgr(style):
+    """The escape sequence that sets one cmux style. A palette color goes by its number, so the phone's theme colors it."""
+    codes = ["0"]
+    for flag, code in (("bold", "1"), ("faint", "2"), ("italic", "3"), ("underline", "4"), ("blink", "5"),
+                       ("inverse", "7"), ("invisible", "8"), ("strikethrough", "9"), ("overline", "53")):
+        if style.get(flag):
+            codes.append(code)
+    for side, base in (("foreground", "38"), ("background", "48")):
+        source = style.get(f"{side}_source")
+        if source == "palette" and isinstance(style.get(f"{side}_palette_index"), int):
+            codes.append(f"{base};5;{style[f'{side}_palette_index']}")
+        elif source not in (None, "default") and re.fullmatch(r"#[0-9A-Fa-f]{6}", style.get(side) or ""):
+            codes.append(f"{base};{rgb(style[side])}")
+    return f"\x1b[{';'.join(codes)}m"
+
+
+def frame(g, offset):
+    """The pane's screen as escape sequences that redraw a terminal of the same size from the top left.
+    offset is how many rows the phone has scrolled back into the pane's history."""
+    rows, history = g.get("rows", 0), g.get("scrollback_rows", 0)
+    offset = max(0, min(offset, history))
+    lines = rows_of(g.get("scrollback_spans", []), history)[history - offset:] + rows_of(g.get("row_spans", []), rows)
+    styles = {s["id"]: sgr(s) for s in g.get("styles", []) if "id" in s}
+    out = ["\x1b[?2026h\x1b[?25l"]
+    for i, row in enumerate(lines[:rows]):
+        out.append(f"\x1b[{i + 1};1H\x1b[0m\x1b[2K")
+        for span in row:
+            out.append(f"\x1b[{span['column'] + 1}G{styles.get(span.get('style_id', 0), chr(27) + '[0m')}{span['text']}")
+    cursor = g.get("cursor") or {}
+    if cursor.get("visible") and not offset:
+        out.append(f"\x1b[0m\x1b[{cursor.get('row', 0) + 1};{cursor.get('column', 0) + 1}H\x1b[?25h")
+    out.append("\x1b[0m\x1b[?2026l")
+    return "".join(out), offset
+
+
+# While a pane is open on the phone it is sized to the phone, so its text wraps at the phone's width.
+# The pane's own size policy is kept and put back when the phone leaves, or stops renewing the lease.
+fit_lock = threading.Lock()
+fitted = {}  # pane id -> {"policy": the pane's own size policy, "size": [cols, rows], "until": lease expiry}
+scrolled = {}  # pane id -> rows the phone has scrolled back
+
+
+def save_fitted():
+    FITTED_FILE.write_text(json.dumps({pane: f["policy"] for pane, f in fitted.items()}))
+
+
+def restore(pane, policy):
+    try:
+        rpc("terminal.size_policy.set", {"surface_id": pane, "policy": policy})
+    except CmuxError as e:
+        if e.code != "not_found":
+            print(f"restore {pane} failed: {e}", flush=True)
+            return False
+    return True
+
+
+def fit(pane, cols, rows):
+    cols, rows = min(max(cols, MIN_COLS), MAX_COLS), min(max(rows, MIN_ROWS), MAX_ROWS)
+    with fit_lock:
+        if pane not in fitted:
+            policy = rpc("terminal.size_state", {"surface_id": pane}).get("size_state", {}).get("policy")
+            fitted[pane] = {"policy": policy or {"mode": "latest", "fixed": None, "priority": []}, "size": None, "until": 0}
+            save_fitted()
+        entry = fitted[pane]
+        if entry["size"] != [cols, rows]:
+            rpc("terminal.size_policy.set", {"surface_id": pane, "policy": {"mode": "fixed", "fixed": {"cols": cols, "rows": rows}, "priority": []}})
+            entry["size"] = [cols, rows]
+        entry["until"] = time.time() + FIT_LEASE_SECONDS
+
+
+def renew(pane):
+    """Keep the pane at the phone's size for another lease. Returns that size, or None if the phone has let go."""
+    with fit_lock:
+        if pane not in fitted:
+            return None
+        fitted[pane]["until"] = time.time() + FIT_LEASE_SECONDS
+        return fitted[pane]["size"]
+
+
+def refit(pane):
+    """cmux drops a size set on a pane that has not started yet, and then takes the same size again as no change.
+    Asking for one row less first makes it apply the phone's size."""
+    with fit_lock:
+        size = (fitted.get(pane) or {}).get("size")
+    if not size:
+        return
+    for rows in (size[1] - 1, size[1]):
+        rpc("terminal.size_policy.set", {"surface_id": pane, "policy": {"mode": "fixed", "fixed": {"cols": size[0], "rows": rows}, "priority": []}})
+        time.sleep(0.5)
+
+
+def release(pane=None):
+    """Hand one pane, or every pane, back to the Mac at its own size."""
+    with fit_lock:
+        for p in [p for p in fitted if pane in (None, p)]:
+            if restore(p, fitted[p]["policy"]):
+                del fitted[p]
+                scrolled.pop(p, None)
+        save_fitted()
+
+
+def housekeeping():
+    while True:
+        time.sleep(3)
+        try:
+            with fit_lock:
+                expired = [p for p, f in fitted.items() if f["until"] < time.time()]
+            for p in expired:
+                release(p)
+        except Exception:
+            traceback.print_exc()
+
+
+def to_bottom(pane):
+    """Typing into a pane the phone has scrolled back shows the bottom again."""
+    scrolled.pop(pane, None)
+
+
+def scroll(pane, up, count, col, row):
+    """A swipe on the phone, as mouse wheel input. An app that reads the mouse gets the wheel itself;
+    otherwise the phone scrolls through the pane's history, which cmux hands over with the screen."""
+    g = grid(pane)
+    if reads_mouse(g):
+        rpc("terminal.input", {"terminal_id": pane, "text": f"\x1b[<{64 if up else 65};{col};{row}M" * count})
+    else:
+        scrolled[pane] = max(0, min(scrolled.get(pane, 0) + (count if up else -count), g.get("scrollback_rows", 0)))
+
+
+def list_panes(window):
+    agents = agent_ttys()
+
+    def summary(numbered):
+        index, s = numbered
+        try:
+            lines = screen_lines(grid(s["id"]))
+        except CmuxError:
+            lines = []
+        while lines and not lines[-1]:
+            lines.pop()
+        agent = agents.get(s["tty"])
+        return {
+            "id": s["id"],
+            "window": index,
+            "window_id": s["workspace"]["id"],
+            "window_name": s["workspace"].get("title") or "",
+            "title": s["title"],
+            "command": "terminal",
+            "active": s["active"],
+            "status": status(lines, agent) if agent else None,
+            "last_line": last_line(lines, agent) if agent else next((l.strip() for l in reversed(lines) if l.strip()), ""),
+        }
+    index = {ws["id"]: i + 1 for i, ws in enumerate(window.get("workspaces", []))}
+    with ThreadPoolExecutor(8) as pool:
+        return list(pool.map(summary, [(index[s["workspace"]["id"]], s) for s in surfaces(window)]))
+
+
+def new_ref(out, kind):
+    m = re.search(rf"\b{kind}:\d+", out)
+    if not m:
+        raise CmuxError("cli", f"cmux did not name the new {kind}: {out.strip()}")
+    return m[0]
+
+
+def wait_for(find, seconds=5):
+    end = time.time() + seconds
+    while time.time() < end:
+        found = find()
+        if found:
+            return found
+        time.sleep(0.1)
+    raise CmuxError("not_found", "cmux didn't show what was just made")
+
+
+def add_window(window):
+    """A new workspace in this cmux window, with one shell in the home folder. Returns its pane's id. The Mac keeps its focus."""
+    ref = new_ref(cmux_cli("new-workspace", "--cwd", str(Path.home()), "--window", window["id"], "--focus", "false"), "workspace")
+    return wait_for(lambda: next((s["id"] for w in windows() for s in surfaces(w) if s["workspace"].get("ref") == ref), None))
+
+
+def add_pane(workspace):
+    """Split the workspace and return the new pane's id: beside its one pane, else under its last pane."""
+    ws = find_workspace(workspace)
+    terminals = [s for pane in ws.get("panes", []) for s in pane.get("surfaces", []) if s.get("type") == "terminal"]
+    if not terminals:
+        raise CmuxError("not_found", f"can't find window {workspace}")
+    side = "right" if len(ws.get("panes", [])) == 1 else "down"
+    ref = new_ref(cmux_cli("new-split", side, "--workspace", ws["id"], "--surface", terminals[-1]["id"], "--focus", "false"), "surface")
+    return wait_for(lambda: next((s["id"] for w in windows() for s in surfaces(w) if s["ref"] == ref), None))
+
+
+def close_pane(s):
+    """Close a pane and whatever runs in it. cmux won't close a workspace's last surface, so then the workspace closes."""
+    release(s["id"])
+    try:
+        rpc("surface.close", {"surface_id": s["id"], "workspace_id": s["workspace"]["id"], "force": True})
+    except CmuxError as e:
+        if "last surface" not in str(e):
+            raise
+        rpc("workspace.close", {"workspace_id": s["workspace"]["id"], "force": True})
+
+
+def new_session():
+    """A new cmux window on the Mac. Returns its id."""
+    before = {w["id"] for w in windows()}
+    rpc("window.create")
+    return wait_for(lambda: next((w["id"] for w in windows() if w["id"] not in before), None))
 
 
 def agent_ttys():
@@ -216,60 +464,6 @@ def status(lines, agent):
     return "idle"
 
 
-def list_panes():
-    # The viewer's panes, which are the target session's, each once: `list-panes -a` would list a grouped window once per session.
-    out = tmux("list-panes", "-s", "-t", f"={VIEWER}", "-F", "\x1f".join(f"#{{{f}}}" for f in PANE_FIELDS))
-    agents = agent_ttys()
-    panes = []
-    for row in out.splitlines():
-        p = dict(zip(PANE_FIELDS, row.split("\x1f")))
-        lines = tmux("capture-pane", "-p", "-t", p["pane_id"]).rstrip().splitlines()
-        agent = agents.get(p["pane_tty"].removeprefix("/dev/"))
-        panes.append({
-            "id": p["pane_id"].lstrip("%"),
-            "window": int(p["window_index"]),
-            "window_id": p["window_id"].lstrip("@"),
-            "window_name": p["window_name"],
-            "title": p["pane_title"],
-            "command": p["pane_current_command"],
-            "active": p["pane_active"] == "1" and p["window_active"] == "1",
-            # The app reads the mouse, so tmux hands it the wheel; if not, the wheel scrolls tmux's copy mode.
-            "reads_mouse": p["mouse_any_flag"] == "1",
-            "border": border_row(p),
-            "status": status(lines, agent) if agent else None,
-            "last_line": last_line(lines, agent) if agent else next((l.strip() for l in reversed(lines) if l.strip()), ""),
-        })
-    return panes
-
-
-def border_row(p):
-    """Which edge of the window holds tmux's pane title row next to this pane: "top", "bottom" or None.
-    Only from tmux's own option and geometry. The phone hides that row, as it shows one pane at a time."""
-    top, height, window_height = int(p["pane_top"]), int(p["pane_height"]), int(p["window_height"])
-    if p["pane-border-status"] == "top" and top == 1:
-        return "top"
-    if p["pane-border-status"] == "bottom" and top + height == window_height - 1:
-        return "bottom"
-    return None
-
-
-def pane_info(pane, *fields):
-    return tmux("display-message", "-p", "-t", pane, "\x1f".join(f"#{{{f}}}" for f in fields)).rstrip("\n").split("\x1f")
-
-
-def open_pane(pane):
-    """Show one pane full screen on the phone: switch the phone's session to it, and zoom it if its window is split.
-    The window is named through the viewer; a bare %pane could pick the Mac's session and switch the Mac."""
-    ensure_viewer()
-    tmux("select-window", "-t", f"={VIEWER}:{pane_info(pane, 'window_id')[0]}")
-    tmux("select-pane", "-t", pane)
-    panes, zoomed = pane_info(pane, "window_panes", "window_zoomed_flag")
-    if panes != "1" and zoomed == "0":
-        tmux("resize-pane", "-Z", "-t", pane)
-    fields = ["pane_top", "pane_height", "window_height", "pane-border-status"]
-    return border_row(dict(zip(fields, pane_info(pane, *fields))))
-
-
 def transcribe(audio):
     """Speech to text on this Mac with whisper-server, which keeps the model loaded; the audio never leaves the Mac."""
     boundary = uuid.uuid4().hex
@@ -304,32 +498,9 @@ def save_upload(data):
     return path
 
 
-def leave_scroll(pane):
-    """Typing into a pane that is scrolled back would land in tmux's copy mode, so leave it first."""
-    if pane_info(pane, "pane_in_mode") == ["1"]:
-        tmux("copy-mode", "-q", "-t", pane)
-
-
 def valid_name(name):
     return (isinstance(name, str) and name.strip() != "" and len(name) <= MAX_NAME
             and not any(unicodedata.category(c) == "Cc" for c in name))
-
-
-def valid_session_name(name):
-    """tmux uses . and : in targets, so a session name can't have them; _phone is the viewer's."""
-    return valid_name(name) and not any(c in name for c in ".:") and name != VIEWER
-
-
-def tmux_literal(name):
-    """tmux reads #{...} in a new name as a format; ## is a plain #."""
-    return name.replace("#", "##")
-
-
-def add_pane(window):
-    """Split the window and return the new pane's id. Side by side if the window is wide, else one above the other."""
-    width, height = (int(n) for n in tmux("display-message", "-p", "-t", window, "#{window_width} #{window_height}").split())
-    side = "-h" if width > 2.5 * height else "-v"
-    return tmux("split-window", side, "-t", window, "-P", "-F", "#{pane_id}").strip().lstrip("%")
 
 
 def version(page):
@@ -337,14 +508,24 @@ def version(page):
     return hashlib.sha1(SERVER_SOURCE + page).hexdigest()[:12]
 
 
-def unzoom(pane):
-    if pane_info(pane, "window_zoomed_flag") == ["1"]:
-        tmux("resize-pane", "-Z", "-t", pane)
-
-
 # The file screen: folders and text files on the Mac, read and written as UTF-8.
+def tty_processes(tty):
+    """[pid, ppid, stat, name] for each process on a tty."""
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,tty=,stat=,comm="], capture_output=True, text=True, env={"LC_ALL": "C"}).stdout
+    rows = [line.split(None, 4) for line in out.splitlines()]
+    return [[r[0], r[1], r[3], os.path.basename(r[4])] for r in rows if len(r) == 5 and r[2] == tty], rows
+
+
 def pane_folder(pane):
-    return pane_info(pane, "pane_current_path")[0]
+    """The folder of the pane's foreground process, or the home folder if it can't be read."""
+    procs, _ = tty_processes(find_pane(pane)["tty"])
+    front = [p[0] for p in procs if "+" in p[2]] or [p[0] for p in procs]
+    for pid in reversed(front):
+        out = subprocess.run(["lsof", "-a", "-d", "cwd", "-p", pid, "-Fn"], capture_output=True, text=True).stdout
+        folder = next((line[1:] for line in out.splitlines() if line.startswith("n")), None)
+        if folder and os.path.isdir(folder):
+            return folder
+    return str(Path.home())
 
 
 def full_path(path, pane):
@@ -403,15 +584,11 @@ def nvim(socket_path, expr):
 
 def nvim_file(pane):
     """The file open in the nvim that is the pane's foreground process, or None."""
-    tty = pane_info(pane, "pane_tty")[0].removeprefix("/dev/")
-    rows = [line.split(None, 4) for line in
-            subprocess.run(["ps", "-A", "-o", "pid=,ppid=,tty=,stat=,comm="], capture_output=True, text=True,
-                           env={"LC_ALL": "C"}).stdout.splitlines()]
-    rows = [r for r in rows if len(r) == 5]
-    front = {r[0] for r in rows if r[2] == tty and "+" in r[3] and os.path.basename(r[4]) == "nvim"}
+    procs, rows = tty_processes(find_pane(pane)["tty"])
+    front = {p[0] for p in procs if "+" in p[2] and p[3] == "nvim"}
     if not front:
         return None
-    pids = front | {r[0] for r in rows if r[1] in front}
+    pids = front | {r[0] for r in rows if len(r) == 5 and r[1] in front}
     for s in nvim_sockets(pids):
         try:
             path = nvim(s, 'expand("%:p")')
@@ -446,6 +623,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def allowed(self, needs_origin):
+        if DEV:
+            return True
         login = self.headers.get("Tailscale-User-Login")
         if login != ALLOWED_LOGIN:
             self.log_message("forbidden: Tailscale-User-Login=%r", login)
@@ -456,35 +635,40 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def cmux_failed(self, e):
+        # The page goes back to the list when it reads "can't find pane".
+        message = str(e) if e.code != "not_found" or "can't find" in str(e) else f"can't find pane: {e}"
+        self.reply(404 if e.code == "not_found" else 503 if e.code == "unavailable" else 502, {"error": message})
+
     def do_GET(self):
-        is_websocket = self.headers.get("Upgrade", "").lower() == "websocket"
-        if not self.allowed(needs_origin=is_websocket):
+        if not self.allowed(needs_origin=False):
             return self.reply(403, {"error": "forbidden"})
         try:
-            if self.path == "/term/ws" and is_websocket:
-                return self.proxy_websocket()
+            m = STREAM_ROUTE.match(self.path)
+            if m:
+                return self.stream(find_pane(m[1])["id"])
             if self.path == "/":
                 page = INDEX.read_bytes()
                 return self.reply(200, page.replace(b"{{VERSION}}", version(page).encode()), "text/html; charset=utf-8")
             if self.path in STATIC_FILES:
                 return self.reply(200, (STATIC / self.path.lstrip("/")).read_bytes(), STATIC_FILES[self.path])
             if self.path == "/api/panes":
-                target = ensure_viewer()
-                panes = list_panes()
-                return self.reply(200, {"panes": panes, "sessions": sessions_for_phone(target),
+                tree = windows()
+                target = target_window(tree)
+                return self.reply(200, {"panes": list_panes(target) if target else [], "sessions": sessions_for_phone(tree, target),
                                         "version": version(INDEX.read_bytes())})
             url = urlsplit(self.path)
             if url.path in ("/api/files", "/api/file"):
                 query = {k: v[0] for k, v in parse_qs(url.query).items()}
-                pane = f"%{query['pane']}" if query.get("pane", "").isdigit() else None
+                pane = query.get("pane") if re.fullmatch(ID, query.get("pane", "")) else None
                 if url.path == "/api/file":
                     return self.reply(200, read_file(full_path(query.get("path"), pane)))
                 # With no path, the pane's folder, and the file open in the pane's nvim if there is one.
                 folder = list_folder(full_path(query.get("path"), pane))
                 return self.reply(200, folder if query.get("path") else {**folder, "nvim_file": pane and nvim_file(pane)})
             self.reply(404, {"error": "not found"})
-        except TmuxError as e:
-            self.reply(502, {"error": str(e)})
+        except CmuxError as e:
+            self.cmux_failed(e)
         except (BrokenPipeError, ConnectionResetError):
             pass
         except OSError as e:
@@ -492,6 +676,43 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             traceback.print_exc()
             self.reply(500, {"error": "server error"})
+
+    def stream(self, pane):
+        """The open pane's screen as server-sent events: a frame whenever the screen, its size or the scroll changes.
+        The open stream is what keeps the pane sized to the phone. It ends when the phone goes or the pane closes."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.close_connection = True
+        seen, quiet, wrong_size = None, 0, 0
+        while True:
+            want = renew(pane)
+            try:
+                g = grid(pane)
+                # A pane still at another size a second after the phone asked is asked again, every two seconds.
+                wrong_size = wrong_size + 1 if want and g and [g.get("columns"), g.get("rows")] != want else 0
+                if wrong_size % 25 == 12:
+                    refit(pane)
+            except CmuxError as e:
+                self.wfile.write(f"event: gone\ndata: {json.dumps(str(e))}\n\n".encode())
+                return self.wfile.flush()
+            key = (g.get("render_epoch"), g.get("render_revision"), g.get("columns"), g.get("rows"), scrolled.get(pane, 0))
+            if key != seen:
+                text, offset = frame(g, scrolled.get(pane, 0))
+                if offset != scrolled.get(pane, 0):
+                    scrolled[pane] = offset
+                body = {"frame": text, "cols": g.get("columns"), "rows": g.get("rows"), "scrolled": offset, "mouse": reads_mouse(g)}
+                self.wfile.write(f"data: {json.dumps(body)}\n\n".encode())
+                self.wfile.flush()
+                seen, quiet = key, 0
+            else:
+                quiet += 1
+                if quiet % 50 == 0:  # a comment line every few seconds, so a phone that left is noticed
+                    self.wfile.write(b": still here\n\n")
+                    self.wfile.flush()
+            time.sleep(STREAM_SECONDS)
 
     def do_POST(self):
         content_type = self.headers.get("Content-Type", "").split(";")[0]
@@ -514,6 +735,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(413, {"error": "too large"})
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(body, dict):
+                return self.reply(400, {"error": "bad json"})
             if self.path == "/api/file":
                 path, text, mtime = body.get("path"), body.get("text"), body.get("mtime")
                 if not all(isinstance(v, str) for v in (path, text, mtime)) or not os.path.isabs(path):
@@ -523,37 +746,61 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(409, {"error": "Not saved: the file changed on disk after you opened it. Go back and open it again."})
                 return self.reply(200, {"mtime": new_mtime})
             if self.path == "/api/windows":
-                ensure_viewer()  # the new window joins the group, so the Mac has it too
-                return self.reply(200, {"pane": tmux("new-window", "-t", f"={VIEWER}:", "-P", "-F", "#{pane_id}").strip().lstrip("%")})
+                target = target_window(windows())
+                if not target:
+                    return self.reply(404, {"error": "cmux has no window open. Tap [edit], then [+ session]."})
+                return self.reply(200, {"pane": add_window(target)})
             if self.path == "/api/sessions":
-                with viewer_lock():
-                    target = new_real_session()
-                    group_viewer(target)
-                return self.reply(200, {"session": target.lstrip("$")})
+                session = new_session()
+                TARGET_FILE.write_text(session)
+                return self.reply(200, {"session": session})
             m = SESSION_ROUTE.match(self.path)
             if m:
-                return self.session_action(f"${m[1]}", m[2], body)
+                return self.session_action(m[1], m[2])
             m = WINDOW_ROUTE.match(self.path)
             if m:
-                window, action = f"@{m[1]}", m[2]
+                workspace, action = m[1], m[2]
                 if action == "panes":
-                    return self.reply(200, {"pane": add_pane(window)})
+                    return self.reply(200, {"pane": add_pane(workspace)})
+                ws = find_workspace(workspace)
                 if action == "close":
-                    tmux("kill-window", "-t", window)
+                    for pane in ws.get("panes", []):
+                        for s in pane.get("surfaces", []):
+                            release(s["id"])
+                    rpc("workspace.close", {"workspace_id": ws["id"], "force": True})
                     return self.reply(200, {"ok": True})
                 if not valid_name(body.get("name")):
                     return self.reply(400, {"error": "bad name"})
-                # Naming a window also turns off tmux's automatic-rename for it, so the name sticks.
-                tmux("rename-window", "-t", window, "--", tmux_literal(body["name"]))
+                rpc("workspace.rename", {"workspace_id": ws["id"], "title": body["name"]})
                 return self.reply(200, {"ok": True})
             m = PANE_ROUTE.match(self.path)
             if not m:
                 return self.reply(404, {"error": "not found"})
-            pane, action = f"%{m[1]}", m[2]
-            if action == "open":
-                return self.reply(200, {"ok": True, "border": open_pane(pane)})
+            s, action = find_pane(m[1]), m[2]
+            pane = s["id"]
+            if action in ("open", "fit"):
+                # The pane takes the phone's size; the terminal stream then keeps it there.
+                cols, rows = body.get("cols"), body.get("rows")
+                if not all(isinstance(v, int) and not isinstance(v, bool) for v in (cols, rows)):
+                    return self.reply(400, {"error": "cols and rows must be whole numbers"})
+                if action == "open":
+                    to_bottom(pane)
+                fit(pane, cols, rows)
+                return self.reply(200, {"ok": True})
             elif action == "back":
-                unzoom(pane)
+                release(pane)
+            elif action == "input":
+                # What the phone's keyboard typed, as the bytes a terminal would send.
+                data = body.get("data")
+                if not isinstance(data, str) or not data:
+                    return self.reply(400, {"error": "bad input"})
+                to_bottom(pane)
+                rpc("terminal.input", {"terminal_id": pane, "text": data})
+            elif action == "scroll":
+                count, col, row = body.get("count"), body.get("col"), body.get("row")
+                if not all(isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 1000 for v in (count, col, row)):
+                    return self.reply(400, {"error": "bad scroll"})
+                scroll(pane, bool(body.get("up")), min(count, 50), col, row)
             elif action == "paste":
                 # Dictated text or photos go into the pane's input; the phone's Enter key submits it.
                 text, images = body.get("text", ""), body.get("images") or []
@@ -572,25 +819,27 @@ class Handler(BaseHTTPRequestHandler):
                     paths.append(str(path))
                 # Claude Code turns a pasted image path into an attachment, but only at the end of the text.
                 text = " ".join([text.strip(), *paths]).strip()
-                leave_scroll(pane)
-                # Bracketed paste, so multi-line text arrives as one paste and nothing is submitted.
-                tmux("load-buffer", "-b", "phone", "-", stdin=text)
-                tmux("paste-buffer", "-p", "-d", "-b", "phone", "-t", pane)
+                to_bottom(pane)
+                # cmux's paste path brackets the text, so multi-line text arrives as one paste and nothing is submitted.
+                rpc("terminal.paste", {"surface_id": pane, "text": text, "submit_key": "none"})
             elif action == "key":
                 key = KEYS.get(body.get("key"))
                 if not key:
                     return self.reply(400, {"error": "key not allowed"})
-                leave_scroll(pane)
-                tmux("send-keys", "-t", pane, key)
+                to_bottom(pane)
+                if key.isdigit():
+                    rpc("surface.send_text", {"surface_id": pane, "text": key})
+                else:
+                    rpc("surface.send_key", {"surface_id": pane, "key": key})
             elif action == "close":
-                tmux("kill-pane", "-t", pane)
+                close_pane(s)
             elif action == "rename":
                 if not valid_name(body.get("name")):
                     return self.reply(400, {"error": "bad name"})
-                tmux("select-pane", "-t", pane, "-T", tmux_literal(body["name"]))
+                rpc("tab.action", {"surface_id": pane, "action": "rename", "title": body["name"]})
             self.reply(200, {"ok": True})
-        except TmuxError as e:
-            self.reply(502, {"error": str(e)})
+        except CmuxError as e:
+            self.cmux_failed(e)
         except ValueError:
             self.reply(400, {"error": "bad json"})
         except OSError as e:
@@ -599,66 +848,23 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self.reply(500, {"error": "server error"})
 
-    def session_action(self, session, action, body):
-        """Switch the phone to a real session, rename it, or close it. Closing the target moves the phone to another."""
-        if session not in {s["session_id"] for s in list_sessions() if s["session_name"] != VIEWER}:
+    def session_action(self, session, action):
+        """Show another cmux window's workspaces on the phone, or close a cmux window and all in it."""
+        window = next((w for w in windows() if w["id"].lower() == session.lower()), None)
+        if not window:
             return self.reply(404, {"error": f"can't find session {session}"})
-        if action == "rename":
-            if not valid_session_name(body.get("name")):
-                return self.reply(400, {"error": "bad name: a session name can't have . or :"})
-            tmux("rename-session", "-t", session, "--", tmux_literal(body["name"]))
-            return self.reply(200, {"ok": True})
-        with viewer_lock():
-            if action == "switch":
-                if fix_viewer() != session:
-                    group_viewer(session)
-            else:
-                # The viewer still holds a killed target's windows; fix_viewer then kills it and its copy of them.
-                tmux("kill-session", "-t", session)
-                fix_viewer()
+        if action == "switch":
+            TARGET_FILE.write_text(window["id"])
+        else:
+            for s in surfaces(window):
+                release(s["id"])
+            rpc("window.close", {"window_id": window["id"]})
         self.reply(200, {"ok": True})
-
-    def proxy_websocket(self):
-        """Hand the checked connection to ttyd and copy bytes both ways until either side closes."""
-        upstream = socket.socket(socket.AF_UNIX)
-        upstream.connect(str(TTYD_SOCKET))
-        # Rebuild the handshake exactly; any stray byte after it reads to ttyd as a broken frame and it hangs up.
-        head = self.requestline + "\r\n" + "".join(f"{k}: {v}\r\n" for k, v in self.headers.items()) + "\r\n"
-        upstream.sendall(head.encode("latin-1"))
-        client = self.connection
-        self.close_connection = True
-
-        def pipe(src, dst):
-            try:
-                while chunk := src.recv(65536):
-                    dst.sendall(chunk)
-            except OSError:
-                pass
-            for s in (src, dst):
-                try:
-                    s.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-
-        t = threading.Thread(target=pipe, args=(upstream, client), daemon=True)
-        t.start()
-        pipe(client, upstream)
-        t.join()
-        upstream.close()
 
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
-
-
-def start_ttyd():
-    """ttyd serves the live terminal on a socket only this server reaches; if it dies, exit so launchd restarts both."""
-    TTYD_SOCKET.unlink(missing_ok=True)
-    proc = subprocess.Popen([
-        "ttyd", "--interface", str(TTYD_SOCKET), "--base-path", "/term", "--writable", "--check-origin",
-        sys.executable, str(Path(__file__).resolve()), "attach",
-    ])
-    threading.Thread(target=lambda: (proc.wait(), os._exit(1)), daemon=True).start()
+    request_queue_size = 64
 
 
 def keep_awake():
@@ -675,16 +881,19 @@ def start_whisper():
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["attach"]:
-        # What ttyd runs for each terminal connection: attach to the viewer, made again if it is gone.
-        ensure_viewer()
-        os.execvp("tmux", ["tmux", "attach", "-t", f"={VIEWER}"])
-    if not (PUBLIC_ORIGIN and ALLOWED_LOGIN):
-        sys.exit("TMUX_PHONE_ORIGIN and TMUX_PHONE_LOGIN must be set; run ./install.sh")
+    if not DEV and not (PUBLIC_ORIGIN and ALLOWED_LOGIN):
+        sys.exit("CMUX_PHONE_ORIGIN and CMUX_PHONE_LOGIN must be set; run ./install.sh")
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    kill_old_viewer()
-    start_ttyd()
-    start_whisper()
-    keep_awake()
-    print(f"tmux-phone on http://{HOST}:{PORT} for {ALLOWED_LOGIN} at {PUBLIC_ORIGIN}", flush=True)
+    # Panes a previous run left sized to the phone go back to the Mac before anything else.
+    try:
+        for pane, policy in json.loads(FITTED_FILE.read_text()).items():
+            restore(pane, policy)
+    except (OSError, ValueError):
+        pass
+    FITTED_FILE.write_text("{}")
+    threading.Thread(target=housekeeping, daemon=True).start()
+    if not DEV:
+        start_whisper()
+        keep_awake()
+    print(f"cmux-phone on http://{HOST}:{PORT} for {ALLOWED_LOGIN or 'anyone on this Mac (--dev)'} at {PUBLIC_ORIGIN or 'localhost'}", flush=True)
     Server((HOST, PORT), Handler).serve_forever()
