@@ -115,6 +115,27 @@ try {
     assert(await shows("typed-on-42"), "not back at the bottom");
   });
 
+  await check("an app that reads the mouse gets a swipe as whole wheel events", async () => {
+    // Counts the wheel events it reads, and any byte that is not part of one: a split event shows as stray bytes.
+    const counter = path.join(state, "wheel_count.py");
+    fs.writeFileSync(counter, [
+      "import os, re, tty", "tty.setcbreak(0)", "print('\\x1b[?1000h\\x1b[?1006h', flush=True)", "n = stray = 0",
+      "while True:", "    d = os.read(0, 65536)", "    n += len(re.findall(rb'\\x1b\\[<64;\\d+;\\d+M', d)) if d.startswith(b'\\x1b') else 0",
+      "    stray += not d.startswith(b'\\x1b')", "    print(f'wheel-{n}-stray-{stray}', flush=True)", "",
+    ].join("\n"));
+    await page.keyboard.type(`python3 ${counter}`);
+    await page.keyboard.press("Enter");
+    await sleep(800);
+    await page.evaluate(() => sendWheel(true, 3, 100, 300));
+    const ok = await shows("wheel-3-stray-0");
+    await page.click("[data-mod=ctrl]");
+    await page.keyboard.type("c");
+    await page.keyboard.type("printf '\\033[?1000l\\033[?1006l'; clear; echo typed-on-$((40+2))");
+    await page.keyboard.press("Enter");
+    assert(ok, `3 rows did not arrive as 3 whole wheel events: ${JSON.stringify((await screen()).trim().split("\n").slice(-2))}`);
+    assert(await shows("typed-on-42"), "the shell did not come back");
+  });
+
   await check("[ctrl] then a key sends the control key", async () => {
     await page.click("[data-mod=ctrl]");
     await page.keyboard.type("l");

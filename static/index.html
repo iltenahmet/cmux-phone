@@ -700,7 +700,7 @@ function disconnect() {
 // The pane's screen has nothing of its own to scroll in the browser. A vertical swipe sends mouse wheel input to
 // the Mac instead: an app that reads the mouse gets it (Claude Code scrolls its own chat), and otherwise the
 // server scrolls back through the pane's history. A tap opens the keyboard.
-// The text follows the finger: one wheel event, one line, per row height of finger movement.
+// The text follows the finger: the rows the finger moved are the rows asked for.
 const MAX_WHEEL = 10;
 let scrollY = null, scrollPx = 0, swiped = false;
 let wheelUps = 0;  // net wheel-up events since the pane was last at the bottom; [↓ bottom] shows while above 0
@@ -726,14 +726,26 @@ function wheelPx() {
   return term.element.querySelector(".xterm-screen").getBoundingClientRect().height / term.rows;
 }
 
-function sendWheel(up, count, x, y) {
+// Rows swiped wait here while a POST is on its way, then go together in the next one, so they arrive in order.
+let wheelRows = 0, wheelAt = null, wheeling = false;
+async function sendWheel(up, count, x, y) {
   if (!current) return;
   wheelUps = Math.max(0, wheelUps + (up ? count : -count));
   $("to-bottom").classList.toggle("hidden", !wheelUps);
   const box = term.element.querySelector(".xterm-screen").getBoundingClientRect();
   const col = Math.min(term.cols, Math.max(1, Math.floor((x - box.left) / (box.width / term.cols)) + 1));
   const row = Math.min(term.rows, Math.max(1, Math.floor((y - box.top) / (box.height / term.rows)) + 1));
-  act(`/api/panes/${current}/scroll`, { up, count, col, row });
+  wheelRows += up ? count : -count;
+  wheelAt = { col, row };
+  if (wheeling) return;
+  wheeling = true;
+  while (wheelRows && current) {
+    const rows = wheelRows;
+    wheelRows = 0;
+    await act(`/api/panes/${current}/scroll`, { up: rows > 0, count: Math.min(Math.abs(rows), 1000), ...wheelAt });
+  }
+  wheelRows = 0;
+  wheeling = false;
 }
 
 $("term-wrap").addEventListener("touchstart", (e) => {
@@ -775,17 +787,12 @@ $("term-wrap").addEventListener("touchend", (e) => {
   if (!swiped) term.focus();  // inside the touch, so iOS opens the keyboard
 }, { passive: true, capture: true });
 
-// [↓ bottom] sends wheel-down in chunks of 10, 20 more than were sent up, in case the count is off.
+// [↓ bottom] scrolls down 20 rows more than were scrolled up, in case the count is off.
 // The pane's history stops at the bottom; Claude Code ignores the extra.
-$("to-bottom").addEventListener("click", async () => {
+$("to-bottom").addEventListener("click", () => {
   const box = term.element.querySelector(".xterm-screen").getBoundingClientRect();
-  let left = wheelUps + 20;
+  sendWheel(false, wheelUps + 20, box.left + box.width / 2, box.top + box.height / 2);
   atBottom();
-  while (left > 0) {
-    sendWheel(false, Math.min(left, 10), box.left + box.width / 2, box.top + box.height / 2);
-    left -= 10;
-    await new Promise((r) => setTimeout(r, 30));
-  }
 });
 
 // Only the terminal zooms: stop iOS from zooming the whole page on a pinch.

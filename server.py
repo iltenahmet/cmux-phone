@@ -59,7 +59,12 @@ KEYS = {"enter": "enter", "escape": "escape", "up": "up", "down": "down", "left"
         "tab": "tab", "shift+tab": "shift+tab", "ctrl+c": "ctrl+c", "alt+p": "alt+p", "0": "0", "1": "1", "2": "2", "3": "3"}
 MIN_COLS, MAX_COLS, MIN_ROWS, MAX_ROWS = 20, 300, 5, 200
 FIT_LEASE_SECONDS = 15  # an open terminal stream renews it; a phone that vanishes hands the pane back to the Mac
-STREAM_SECONDS = 0.08  # how often an open pane's screen is read
+STREAM_SECONDS = 0.025  # how often an open pane's screen is read while it is changing
+IDLE_STREAM_SECONDS = 0.06  # and once it has been still for a second
+# Claude Code scrolls further per wheel event when events come under 40 ms apart, so scroll calls stay further apart.
+WHEEL_SECONDS = 0.07
+WHEEL_ROWS = (3, 8, 16)  # rows Claude Code scrolls for 1, 2 and 3 lines in one cmux scroll call
+MAX_WHEEL_ROWS = 400  # the most scrolling one pane can be owed
 MOUSE_MODES = {1000, 1002, 1003}  # the app in the pane asked for mouse events, so it gets the wheel
 
 
@@ -329,14 +334,55 @@ def to_bottom(pane):
     scrolled.pop(pane, None)
 
 
+wheel_lock = threading.Lock()
+wheel = {}  # pane id -> rows still owed to the app (up is positive), where the finger is, and the last call's direction
+
+
 def scroll(pane, up, count, col, row):
-    """A swipe on the phone, as mouse wheel input. An app that reads the mouse gets the wheel itself;
-    otherwise the phone scrolls through the pane's history, which cmux hands over with the screen."""
+    """A swipe on the phone, in rows. An app that reads the mouse gets it as wheel input; otherwise the
+    phone scrolls through the pane's history, which cmux hands over with the screen."""
     g = grid(pane)
-    if reads_mouse(g):
-        rpc("terminal.input", {"terminal_id": pane, "text": f"\x1b[<{64 if up else 65};{col};{row}M" * count})
-    else:
+    if not reads_mouse(g):
         scrolled[pane] = max(0, min(scrolled.get(pane, 0) + (count if up else -count), g.get("scrollback_rows", 0)))
+        return
+    rows = count if up else -count
+    with wheel_lock:
+        w = wheel.setdefault(pane, {"rows": 0, "up": None, "at": 0, "running": False})
+        # A swipe the other way drops what is still owed; a row or two of overshoot is kept and taken off.
+        owed = 0 if w["rows"] * rows < 0 and abs(w["rows"]) > 2 else w["rows"]
+        w.update(rows=max(-MAX_WHEEL_ROWS, min(MAX_WHEEL_ROWS, owed + rows)), col=col, row=row)
+        if w["running"]:
+            return
+        w["running"] = True
+    threading.Thread(target=turn_wheel, args=(pane,), daemon=True).start()
+
+
+def turn_wheel(pane):
+    """Pay out the rows a pane is owed through cmux's own scroll call, which sends three wheel events a line.
+    Calls are spaced so Claude Code moves a known number of rows for each."""
+    while True:
+        with wheel_lock:
+            w = wheel[pane]
+            wait = w["at"] + WHEEL_SECONDS - time.monotonic()
+            if wait <= 0:
+                if abs(w["rows"]) < 2:
+                    w["running"] = False
+                    return
+                up = w["rows"] > 0
+                lines = 3 if abs(w["rows"]) >= WHEEL_ROWS[2] else 2 if abs(w["rows"]) >= WHEEL_ROWS[1] else 1
+                # Claude Code ignores the first wheel event after a change of direction.
+                moved = WHEEL_ROWS[lines - 1] - (w["up"] not in (None, up))
+                w.update(rows=w["rows"] - (moved if up else -moved), up=up, at=time.monotonic())
+                call = {"surface_id": pane, "delta_lines": lines if up else -lines, "col": w["col"] - 1, "row": w["row"] - 1}
+        if wait > 0:
+            time.sleep(wait)
+            continue
+        try:
+            rpc("terminal.scroll", call)
+        except CmuxError:
+            with wheel_lock:
+                wheel.pop(pane, None)
+            return
 
 
 def list_panes(window):
@@ -686,14 +732,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
         self.close_connection = True
-        seen, quiet, wrong_size = None, 0, 0
+        seen, changed, said, asked = None, time.monotonic(), time.monotonic(), time.monotonic()
         while True:
             want = renew(pane)
+            now = time.monotonic()
             try:
                 g = grid(pane)
                 # A pane still at another size a second after the phone asked is asked again, every two seconds.
-                wrong_size = wrong_size + 1 if want and g and [g.get("columns"), g.get("rows")] != want else 0
-                if wrong_size % 25 == 12:
+                if not want or not g or [g.get("columns"), g.get("rows")] == want:
+                    asked = now - 1
+                elif now - asked > 2:
+                    asked = now
                     refit(pane)
             except CmuxError as e:
                 self.wfile.write(f"event: gone\ndata: {json.dumps(str(e))}\n\n".encode())
@@ -706,13 +755,12 @@ class Handler(BaseHTTPRequestHandler):
                 body = {"frame": text, "cols": g.get("columns"), "rows": g.get("rows"), "scrolled": offset, "mouse": reads_mouse(g)}
                 self.wfile.write(f"data: {json.dumps(body)}\n\n".encode())
                 self.wfile.flush()
-                seen, quiet = key, 0
-            else:
-                quiet += 1
-                if quiet % 50 == 0:  # a comment line every few seconds, so a phone that left is noticed
-                    self.wfile.write(b": still here\n\n")
-                    self.wfile.flush()
-            time.sleep(STREAM_SECONDS)
+                seen, changed, said = key, now, now
+            elif now - said > 4:  # a comment line every few seconds, so a phone that left is noticed
+                self.wfile.write(b": still here\n\n")
+                self.wfile.flush()
+                said = now
+            time.sleep(STREAM_SECONDS if now - changed < 1 else IDLE_STREAM_SECONDS)
 
     def do_POST(self):
         content_type = self.headers.get("Content-Type", "").split(";")[0]
@@ -800,7 +848,7 @@ class Handler(BaseHTTPRequestHandler):
                 count, col, row = body.get("count"), body.get("col"), body.get("row")
                 if not all(isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 1000 for v in (count, col, row)):
                     return self.reply(400, {"error": "bad scroll"})
-                scroll(pane, bool(body.get("up")), min(count, 50), col, row)
+                scroll(pane, bool(body.get("up")), count, col, row)
             elif action == "paste":
                 # Dictated text or photos go into the pane's input; the phone's Enter key submits it.
                 text, images = body.get("text", ""), body.get("images") or []
